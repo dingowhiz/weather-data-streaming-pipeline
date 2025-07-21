@@ -1,0 +1,18 @@
+# Weather Processor Requirements
+# Core streaming and messaging
+quixstreams>=2.0.0
+confluent-kafka>=2.0.0
+
+# Google Sheets integration
+pygsheets>=2.0.6
+google-api-python-client>=2.0.0
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=0.5.0
+
+# Data processing and utilities
+python-dotenv>=0.19.0
+requests>=2.28.0
+
+# Development and testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
