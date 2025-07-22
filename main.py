@@ -1,12 +1,14 @@
 import logging
 import json
 import sys
+import os
 from quixstreams import Application
 from confluent_kafka.admin import AdminClient
 from confluent_kafka import KafkaException
 import config
 import time
 import pygsheets
+from datetime import timedelta
 
 def check_kafka_connection(broker_address, timeout=5):
     """Check if Kafka broker is accessible"""
@@ -30,14 +32,9 @@ def setup_google_sheets():
         return None, None
     
     try:
-        import os
-        
-        # Check if we have an API key for read-only mode
+        # Check for API key
         if config.GOOGLE_SHEETS_API_KEY:
-            logging.warning("Google Sheets API key detected, but API keys only support READ operations")
-            logging.warning("For WRITE operations (which we need), you must use service account credentials")
-            logging.info("Falling back to service account authentication...")
-        
+            logging.warning("Google Sheets API key detected")        
         # Check for service account credentials
         if not os.path.exists(config.GOOGLE_SHEETS_CREDENTIALS_FILE):
             logging.warning(f"Google Sheets credentials file not found: {config.GOOGLE_SHEETS_CREDENTIALS_FILE}")
@@ -55,29 +52,32 @@ def setup_google_sheets():
         if config.GOOGLE_SHEETS_AUTH_METHOD == 'service_account':
             google_api = pygsheets.authorize(service_file=config.GOOGLE_SHEETS_CREDENTIALS_FILE)
         else:
-            # Try OAuth2 (requires user interaction)
+            # Try OAuth2 authentication
             google_api = pygsheets.authorize()
         
-        # Open workbook by ID if provided, otherwise by name
-        if config.GOOGLE_SHEETS_WORKBOOK_ID:
-            workbook = google_api.open_by_key(config.GOOGLE_SHEETS_WORKBOOK_ID)
-        else:
-            workbook = google_api.open(config.GOOGLE_SHEETS_WORKBOOK_NAME)
-            
+        workbook = google_api.open(config.GOOGLE_SHEETS_WORKBOOK_NAME)
         sheet = workbook[config.GOOGLE_SHEETS_WORKSHEET_INDEX]
         
         # Initialize headers if needed
-        headers = ["Timestamp", "Temperature_C", "Temperature_F", "Humidity", "Wind_Speed", "Weather_Description", "Data_Quality", "Processing_Pipeline"]
+        headers = ["Timestamp(GMT)", "Temperature_C", "Temperature_F", "Humidity", "Wind_Speed", "Weather_Description", "Data_Quality", "Pipeline_Name"]
         try:
-            # Check if headers already exist
-            existing_headers = sheet.get_values('A1', 'H1')
-            if not existing_headers or not existing_headers[0]:
-                sheet.update_values('A1:H1', [headers])
-                logging.info("Headers initialized in Google Sheet")
-        except Exception as header_error:
-            # If check fails, just write headers
+            # Always update headers to ensure they are correct
             sheet.update_values('A1:H1', [headers])
-            logging.info("Headers written to Google Sheet")
+            logging.info("Headers updated in Google Sheet")
+            
+            # Verify headers were written correctly
+            try:
+                existing_headers = sheet.get_values('A1', 'H1')
+                if existing_headers and existing_headers[0]:
+                    logging.info(f"Headers confirmed: {existing_headers[0]}")
+                else:
+                    logging.warning("Headers may not have been written correctly")
+            except Exception as verify_error:
+                logging.debug(f"Header verification failed (headers likely still updated): {verify_error}")
+                
+        except Exception as header_error:
+            logging.error(f"Failed to update headers: {header_error}")
+            logging.warning("Continuing without proper headers - manual header setup may be required")
         
         logging.info(f"Google Sheets connected: {workbook.title}")
         logging.info(f"Sheet URL: https://docs.google.com/spreadsheets/d/{workbook.id}")
@@ -85,7 +85,6 @@ def setup_google_sheets():
         
     except Exception as e:
         logging.warning(f"Failed to setup Google Sheets: {e}")
-        logging.info("Continuing without Google Sheets integration")
         return None, None
 
 def write_to_google_sheets(sheet, weather_data):
@@ -105,16 +104,15 @@ def write_to_google_sheets(sheet, weather_data):
             weather_data.get('data_quality_score', ''),
             weather_data.get('processing_pipeline', 'weather_stream_processor')
         ]
-        
         # Append to sheet using proper range notation
         try:
-            # Find next available row and write data
+            # write data
             all_values = sheet.get_all_values()
             next_row = len(all_values) + 1
             range_notation = f'A{next_row}:H{next_row}'
             sheet.update_values(range_notation, [row_data])
         except Exception as range_error:
-            # Fallback: use append_table method
+            # Fallback: use append_table method by adding rows to end of data
             logging.warning(f"Range method failed: {range_error}, trying append_table")
             sheet.append_table(values=[row_data])
             
@@ -122,7 +120,7 @@ def write_to_google_sheets(sheet, weather_data):
         
     except Exception as e:
         logging.error(f"Failed to write to Google Sheets: {e}")
-        raise  # Re-raise to be caught by the calling function
+        raise  
       
 def initializer_fn(msg):
     temperature = msg["current"]['temperature_2m']
@@ -155,11 +153,10 @@ def main():
   # Check Kafka connection before proceeding
   if not check_kafka_connection(config.KAFKA_BROKER_ADDRESS, config.KAFKA_CONNECTION_TIMEOUT):
       logging.error("Cannot proceed without Kafka connection. Please ensure Kafka is running.")
-      logging.info("To start Kafka, you typically need to:")
+      logging.info("To start Kafka:")
       logging.info("1. Start Zookeeper: bin/zookeeper-server-start.sh config/zookeeper.properties")
       logging.info("2. Start Kafka: bin/kafka-server-start.sh config/server.properties")
       logging.info(f"Current broker address: {config.KAFKA_BROKER_ADDRESS}")
-      logging.info("You can change the broker address by setting KAFKA_BROKER_ADDRESS environment variable")
       sys.exit(1)
   
   app = Application(
@@ -206,7 +203,7 @@ def main():
       sys.exit(1)
 
   def transform(msg):
-      """Transform weather data - add processing timestamp and temperature in Fahrenheit"""
+      """Transform weather data - add processing timestamp and temperature in Fahrenheit to Google Sheets"""
       
       # Make a copy of the message
       new_msg = msg.copy()
@@ -258,6 +255,14 @@ def main():
       return new_msg
 
   sdf = app.dataframe(input_topic)
+  sdf = sdf.tumbling_window(duration_ms=timedelta(hours=1))
+  sdf = sdf.reduce(
+      initializer=initializer_fn,
+      reducer=reducer_fn
+  )
+  sdf = sdf.final()
+  sdf = sdf.update(lambda msg: logging.debug("Updated message: %s", msg))
+  
   sdf = sdf.apply(transform)
   sdf = sdf.to_topic(output_topic)
 
